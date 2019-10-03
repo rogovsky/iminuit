@@ -1,0 +1,15 @@
+numpy
+cython
+scipy
+matplotlib
+ipython
+jupyter
+pytest
+pytest-cov
+
+sphinx
+sphinx_rtd_theme
+
+pylint
+flake8
+pydocstyle

@@ -11,21 +11,66 @@ cdef extern from "<memory>" namespace "std":
 
 cdef extern from "Minuit2/FCNBase.h":
     cdef cppclass FCNBase:
-        double call "operator()"(vector[double] x) except+
-        double ErrorDef()
+        double call "operator()"(vector[double] x) except +
+        double Up()
+        void SetErrorDef(double)
 
 cdef extern from "Minuit2/FCNGradientBase.h":
-    cdef cppclass FCNGradientBase:
-        FCNGradientBase(object fcn, double up_parm, vector[string] pname, bint thrownan)
-        double call "operator()"(vector[double] x) except +  #raise_py_err
+    cdef cppclass FCNGradientBase(FCNBase):
+        vector[double] call "Gradient"(vector[double] x) except +
+
+cdef extern from "IMinuitMixin.h":
+    cdef cppclass IMinuitMixin:
+        int getNumCall()
+        void resetNumCall()
+
+cdef extern from "Utils.h":
+    FunctionMinimum* call_mnapplication_wrapper(
+        MnApplication app, unsigned int i, double tol) except +
+
+cdef extern from "PythonFCN.h":
+    cdef cppclass PythonFCN(FCNBase, IMinuitMixin):
+        PythonFCN(object fcn, bint use_array_call, double up_parm, vector[string] pname, bint thrownan)
+
+cdef extern from "PythonGradientFCN.h":
+    cdef cppclass PythonGradientFCN(FCNGradientBase, IMinuitMixin):
+        PythonGradientFCN(object fcn, object grad, bint use_array_call, double up_parm, vector[string] pname, bint thrownan)
+        int getNumGrad()
+        void resetNumGrad()
+
+cdef extern from "Minuit2/FunctionMinimum.h":
+    cdef cppclass FunctionMinimum:
+        bint IsValid()
+        MnUserParameterState UserState()
+        bint HasAccurateCovar()
+        double Fval()
+        double Edm()
+        int NFcn()
         double Up()
-        vector[double] Gradient(vector[double] x) except +  #raise_py_err
-        bint CheckGradient()
+        bint HasValidParameters()
+        bint HasPosDefCovar()
+        bint HasMadePosDefCovar()
+        bint HesseFailed()
+        bint HasCovariance()
+        bint HasReachedCallLimit()
+        bint IsAboveMaxEdm()
+
+cdef extern from "Minuit2/MinimumBuilder.h":
+    cdef cppclass MinimumBuilder:
+        int StorageLevel()
+        int PrintLevel()
+        void SetPrintLevel(int)
+        void SetStorageLevel(int)
+
+cdef extern from "Minuit2/ModularFunctionMinimizer.h":
+    cdef cppclass ModularFunctionMinimizer:
+        MinimumBuilder Builder()
 
 cdef extern from "Minuit2/MnApplication.h":
     cdef cppclass MnApplication:
         FunctionMinimum call "operator()"(int, double) except+
         void SetPrecision(double)
+        ModularFunctionMinimizer Minimizer()
 
 cdef extern from "Minuit2/MinuitParameter.h":
     cdef cppclass MinuitParameter:
@@ -57,13 +102,13 @@ cdef extern from "Minuit2/MnUserParameterState.h":
     cdef cppclass MnUserParameterState:
         MnUserParameterState()
         MnUserParameterState(MnUserParameterState mpst)
-        vector[double] Params()
+        operator=(MnUserParameterState)
+
         void Add(char*name, double val, double err)
         void Add(char*name, double val, double err, double, double)
         void Add(char*, double)
 
         vector[MinuitParameter] MinuitParameters()
-        #MnUserParameters parameters()
         MnUserCovariance Covariance()
         MnGlobalCorrelationCoeff GlobalCC()
 
@@ -71,21 +116,20 @@ cdef extern from "Minuit2/MnUserParameterState.h":
         double Edm()
         unsigned int NFcn()
 
-        void Fix(char*)
-        void Release(char*)
-        void SetValue(char*, double)
-        void SetError(char*, double)
-        void SetLimits(char*, double, double)
-        void SetUpperLimit(char*, double)
-        void SetLowerLimit(char*, double)
-        void RemoveLimits(char*)
+        const MinuitParameter& Parameter(unsigned int)
+
+        void Fix(unsigned int)
+        void Release(unsigned int)
+        void SetValue(unsigned int, double)
+        void SetError(unsigned int, double)
+        void SetLimits(unsigned int, double, double)
+        void SetUpperLimit(unsigned int, double)
+        void SetLowerLimit(unsigned int, double)
+        void RemoveLimits(unsigned int)
 
         bint IsValid()
         bint HasCovariance()
         bint HasGlobalCC()
-
-        double Value(char*)
-        double Error(char*)
 
         unsigned int Index(char*)
         char*Name(unsigned int)
@@ -104,8 +148,8 @@ cdef extern from "Minuit2/MnMigrad.h":
 cdef extern from "Minuit2/MnHesse.h":
     cdef cppclass MnHesse:
         MnHesse(unsigned int stra)
-        MnUserParameterState call "operator()"(FCNBase, MnUserParameterState, unsigned int maxcalls=0) except+
-        MnUserParameterState call "operator()"(FCNGradientBase, MnUserParameterState, unsigned int maxcalls=0) except+
+        MnUserParameterState call "operator()"(FCNBase, MnUserParameterState, unsigned int maxcalls) except+
+        MnUserParameterState call "operator()"(FCNGradientBase, MnUserParameterState, unsigned int maxcalls) except+
 
 cdef extern from "Minuit2/MnMinos.h":
     cdef cppclass MnMinos:
@@ -152,9 +196,6 @@ cdef extern from "Minuit2/FunctionMinimum.h":
         bint HasCovariance()
         bint HasReachedCallLimit()
         bint IsAboveMaxEdm()
-
-cdef extern from "Minuit2/VariableMetricBuilder.h":
-    void set_migrad_print_level "VariableMetricBuilder::setPrintLevel"(int p)
 
 cdef extern from "Minuit2/MnContours.h":
     cdef cppclass MnContours:

@@ -1,5 +1,7 @@
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
+from numpy.testing import assert_allclose
+import os
 
 __all__ = [
     'requires_dependency',
@@ -7,7 +9,7 @@ __all__ = [
 ]
 
 
-def requires_dependency(name):
+def requires_dependency(*names):
     """Decorator to declare required dependencies for tests.
 
     Parameters
@@ -27,18 +29,17 @@ def requires_dependency(name):
             import numpy
             ...
     """
-    try:
-        __import__(name)
-        skip_it = False
-    except ImportError:
-        skip_it = True
+    skip_it = False
+    for name in names:
+        path = os.path.dirname(__file__)
+        p = os.path.join(path, name + ".pyx")
+        if os.path.exists(p):
+            continue
+        try:
+            __import__(name)
+        except ImportError:
+            skip_it = True
 
     reason = 'Missing dependency: {}'.format(name)
     import pytest
     return pytest.mark.skipif(skip_it, reason=reason)
-
-try:
-    from numpy.testing import assert_allclose
-except ImportError:
-    print('ERROR: Running the iminuit tests requires Numpy (for float comparisons)!')
-    raise

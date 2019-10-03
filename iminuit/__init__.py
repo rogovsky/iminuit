@@ -1,4 +1,5 @@
-"""MINUIT from Python - Fitting like a boss
+"""
+MINUIT2 from Python
 
 Basic usage example::
 
@@ -12,23 +13,22 @@ Basic usage example::
 
 Further information:
 
-* Code: https://github.com/iminuit/iminuit
-* Docs: http://iminuit.readthedocs.org/
+* Code: https://github.com/scikit-hep/iminuit
+* Docs: https://iminuit.readthedocs.io
 """
 
 __all__ = [
     'Minuit',
+    'minimize',
     'describe',
-    'Struct',
-    'InitialParamWarning',
     '__version__',
     'test',
 ]
 
-from iminuit._libiminuit import *
-from iminuit.util import describe, Struct
-from iminuit.iminuit_warnings import *
-from iminuit.info import __version__
+from ._libiminuit import Minuit
+from ._minimize import minimize
+from .util import describe
+from .info import __version__
 
 
 def test(args=None):
@@ -38,9 +38,9 @@ def test(args=None):
 
     From the command line:
 
-        python -c 'import iminuit; iminuit.test()
+        python -c 'import iminuit; iminuit.test()'
     """
     # http://pytest.org/latest/usage.html#calling-pytest-from-python-code
     import pytest
-    args = '--pyargs iminuit'
+    args = ['-v', '--pyargs', 'iminuit']
     pytest.main(args)

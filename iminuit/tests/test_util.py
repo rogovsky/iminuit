@@ -1,5 +1,4 @@
-from __future__ import (absolute_import, division, print_function,
-                        unicode_literals)
+from __future__ import (absolute_import, division, print_function)
 from iminuit.util import (fitarg_rename,
                           true_param,
                           param_name,
@@ -9,12 +8,21 @@ from iminuit.util import (fitarg_rename,
                           extract_fix,
                           remove_var,
                           arguments_from_docstring,
-                          )
+                          Matrix,
+                          FMin,
+                          Param,
+                          MError,
+                          Params,
+                          MigradResult)
+import pytest
 
 
 def test_fitarg_rename():
     fitarg = {'x': 1, 'limit_x': (2, 3), 'fix_x': True, 'error_x': 10}
-    ren = lambda x: 'z_' + x
+
+    def ren(x):
+        return 'z_' + x
+
     newfa = fitarg_rename(fitarg, ren)
     assert 'z_x' in newfa
     assert 'limit_z_x' in newfa
@@ -113,3 +121,73 @@ def test_arguments_from_docstring():
     s = 'Minuit.migrad( int ncall_me =10000, [resume=True, int nsplit=1])'
     a = arguments_from_docstring(s)
     assert a == ['ncall_me', 'resume', 'nsplit']
+
+
+def test_Matrix():
+    x = Matrix(("a", "b"), [[1, 2],[3, 4]])
+    assert x[0] == (1, 2)
+    assert x[1] == (3, 4)
+    assert x == ((1, 2), (3, 4))
+    assert repr(x) == '((1, 2), (3, 4))'
+    with pytest.raises(TypeError):
+        x[0] = (1, 2)
+    with pytest.raises(TypeError):
+        x[0][0] = 1
+
+
+def test_Param():
+    keys = "number name value error is_const is_fixed has_limits has_lower_limit has_upper_limit lower_limit upper_limit".split()
+    values = 3, "foo", 1.2, 3.4, False, False, True, True, False, 42, None
+    p = Param(*values)
+
+    assert p.has_lower_limit == True
+    assert p.has_upper_limit == False
+    assert p["has_lower_limit"] == True
+    assert p["lower_limit"] == 42
+    assert p["upper_limit"] == None
+    assert "upper_limit" in p
+    assert "foo" not in p
+
+    assert [key for key in p] == keys
+    assert p.keys() == tuple(keys)
+    assert p.values() == values
+    assert p.items() == tuple((k, v) for k, v in zip(keys, values))
+
+    assert str(p) == "Param(number=3, name='foo', value=1.2, error=3.4, is_const=False, is_fixed=False, has_limits=True, has_lower_limit=True, has_upper_limit=False, lower_limit=42, upper_limit=None)"
+
+
+def test_MError():
+    keys = "name is_valid lower upper lower_valid upper_valid at_lower_limit at_upper_limit at_lower_max_fcn at_upper_max_fcn lower_new_min upper_new_min nfcn min".split()
+    values = "Foo", True, 0.1, 1.2, True, True, False, False, False, False, 0.1, 1.2, 42, 0.2
+
+    m = MError(*values)
+
+    assert m.keys() == tuple(keys)
+    assert m.values() == values
+    assert m.name == "Foo"
+    assert m["name"] == "Foo"
+
+
+def test_FMin():
+    keys = "fval edm tolerance nfcn ncalls up is_valid has_valid_parameters has_accurate_covar has_posdef_covar has_made_posdef_covar hesse_failed has_covariance is_above_max_edm has_reached_call_limit".split()
+    values = 0.2, 1e-3, 0.1, 10, 10, 1.2, False, False, False, False, False, False, False, False, False
+
+    f = FMin(*values)
+
+    assert f.keys() == tuple(keys)
+    assert f.values() == values
+    assert f.fval == 0.2
+    assert f["fval"] == 0.2
+
+
+def test_MigradResult():
+    fmin = FMin(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)
+    params = Params([], None)
+    mr = MigradResult(fmin, params)
+    assert mr.fmin is fmin
+    assert mr[0] is fmin
+    assert mr.params is params
+    assert mr[1] is params
+    a, b = mr
+    assert a is fmin
+    assert b is params

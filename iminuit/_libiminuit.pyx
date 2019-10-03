@@ -1,82 +1,200 @@
-# cython: embedsignature=True, c_string_type=str, c_string_encoding=ascii
+# cython: embedsignature=True, c_string_type=str, c_string_encoding=ascii, language_level=2
 # distutils: language = c++
-"""IPython Minuit class definition.
-"""
+"""IPython Minuit class definition."""
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
-import array
 from warnings import warn
 from libc.math cimport sqrt
 from libcpp.string cimport string
 from libcpp.cast cimport dynamic_cast
 from cython.operator cimport dereference as deref
-from iminuit.py23_compat import ARRAY_DOUBLE_TYPECODE
-from iminuit.util import *
-from iminuit.iminuit_warnings import (InitialParamWarning,
-                                      HesseFailedWarning)
+from iminuit import util as mutil
+from iminuit.iminuit_warnings import HesseFailedWarning
 from iminuit.latex import LatexFactory
-from iminuit import _plotting
+from iminuit import _minuit_methods
+from collections import OrderedDict
 
 include "Minuit2.pxi"
 include "Minuit2Struct.pxi"
 
+cimport numpy as np
+import numpy as np
+np.import_array()
+
 __all__ = ['Minuit']
 
-# Our wrappers
+# Pointer types
 ctypedef FCNGradientBase* FCNGradientBasePtr
+ctypedef IMinuitMixin* IMinuitMixinPtr
+ctypedef PythonGradientFCN* PythonGradientFCNPtr
+ctypedef MnUserParameterState* MnUserParameterStatePtr
 
-cdef extern from "PythonFCNBase.h":
-    cdef cppclass PythonFCNBase:
-        PythonFCNBase(object fcn, double up_parm, vector[string] pname, bint thrownan)
-        double call "operator()"(vector[double] x) except +  #raise_py_err
-        double Up()
-        int getNumCall()
-        void set_up(double up)
-        void resetNumCall()
+# Helper functions
+cdef set_parameter_state(MnUserParameterStatePtr state, object parameters, dict fitarg):
+    """Construct parameter state from user input.
 
-cdef extern from "Minuit2/FCNBase.h":
-    cdef cppclass FCNBase:
-        FCNBase(object fcn, double up_parm, vector[string] pname, bint thrownan)
-        double call "operator()"(vector[double] x) except +  #raise_py_err
-        double Up()
+    Caller is responsible for cleaning up the pointer.
+    """
+    cdef double inf = float("infinity")
+    cdef double val
+    cdef double err
+    cdef double lb
+    cdef double ub
+    for i, pname in enumerate(parameters):
+        val = fitarg[pname]
+        err = fitarg['error_' + pname]
+        state.Add(pname, val, err)
 
-cdef extern from "Minuit2/FCNGradientBase.h":
-    cdef cppclass FCNGradientBase:
-        FCNGradientBase(object fcn, double up_parm, vector[string] pname, bint thrownan)
-        double call "operator()"(vector[double] x) except +  #raise_py_err
-        double Up()
-        vector[double] Gradient(vector[double] x) except +  #raise_py_err
-        bint CheckGradient()
+        lim = fitarg['limit_' + pname]
+        if lim is not None:
+            lb = -inf if lim[0] is None else lim[0]
+            ub = inf if lim[1] is None else lim[1]
+            if lb == ub:
+                state.SetValue(i, lb)
+                state.Fix(i)
+            else:
+                if lb > ub:
+                    raise ValueError(
+                        'limit for parameter %s is invalid. %r' % (pname, (lb, ub)))
+                if lb == -inf and ub == inf:
+                    pass
+                elif ub == inf:
+                    state.SetLowerLimit(i, lb)
+                elif lb == -inf:
+                    state.SetUpperLimit(i, ub)
+                else:
+                    state.SetLimits(i, lb, ub)
+                # need to set value again so that MINUIT can
+                # correct internal/external transformation;
+                # also use opportunity to correct a starting value outside of limit
+                val = max(val, lb)
+                val = min(val, ub)
+                state.SetValue(i, val)
+                state.SetError(i, err)
 
-cdef extern from "PythonFCN.h":
-    #int raise_py_err()#this is very important we need custom error handler
-    FunctionMinimum*call_mnapplication_wrapper( \
-            MnApplication app, unsigned int i, double tol) except +
-    cdef cppclass PythonFCN(FCNBase, PythonFCNBase):
-        PythonFCN( \
-                object fcn, double up_parm, vector[string] pname, bint thrownan)
-        double call "operator()"(vector[double] x) except +  #raise_py_err
-        double Up()
-        int getNumCall()
-        void set_up(double up)
-        void resetNumCall()
-
-cdef extern from "PythonGradientFCN.h":
-    #int raise_py_err()#this is very important we need custom error handler
-    cdef cppclass PythonGradientFCN(FCNBase, PythonFCNBase):
-        PythonGradientFCN( \
-                object fcn, object grad_fcn, double up_parm, vector[string] pname, bint thrownan)
-        double call "operator()"(vector[double] x) except +  #raise_py_err
-        vector[double] call "gradient()"(vector[double] x) except +  #raise_py_err
-        double Up()
-        int getNumCall()
-        void set_up(double up)
-        void resetNumCall()
+        if fitarg['fix_' + pname]:
+            state.Fix(i)
 
 
-#look up map with default
-cdef maplookup(m, k, d):
-    return m[k] if k in m else d
+cdef check_extra_args(parameters, kwd):
+    """Check keyword arguments to find unwanted/typo keyword arguments"""
+    fixed_param = set('fix_' + p for p in parameters)
+    limit_param = set('limit_' + p for p in parameters)
+    error_param = set('error_' + p for p in parameters)
+    for k in kwd.keys():
+        if k not in parameters and \
+                        k not in fixed_param and \
+                        k not in limit_param and \
+                        k not in error_param:
+            raise RuntimeError(
+                ('Cannot understand keyword %s. May be a typo?\n'
+                 'The parameters are %r') % (k, parameters))
+
+def is_number(value):
+    return isinstance(value, (int, long, float))
+
+def is_int(value):
+    return isinstance(value, (int, long))
+
+# Helper classes
+cdef class BasicView:
+    """Dict-like view of parameter state.
+
+    Derived classes need to implement methods _set and _get to access
+    specific properties of the parameter state."""
+    cdef object _minuit
+    cdef MnUserParameterStatePtr _state
+
+    def __init__(self, minuit):
+        self._minuit = minuit
+
+    def __iter__(self):
+        return self._minuit.pos2var.__iter__()
+
+    def __len__(self):
+        return len(self._minuit.pos2var)
+
+    def keys(self):
+        return [k for k in self]
+
+    def items(self):
+        return [(name, self._get(k)) for (k, name) in enumerate(self)]
+
+    def values(self):
+        return [self._get(k) for k in range(len(self))]
+
+    def __getitem__(self, key):
+        cdef int i = key if is_int(key) else self._minuit.var2pos[key]
+        return self._get(i)
+
+    def __setitem__(self, key, value):
+        cdef int i = key if is_int(key) else self._minuit.var2pos[key]
+        self._set(i, value)
+
+    def __repr__(self):
+        s = "<%s of Minuit at %x>" % (self.__class__.__name__, id(self._minuit))
+        for (k, v) in self.items():
+            s += "\n  {0}: {1}".format(k, v)
+        return s
+
+
+cdef class ArgsView:
+    """List-like view of parameter values."""
+    cdef object _minuit
+    cdef MnUserParameterStatePtr _state
+
+    def __init__(self, minuit):
+        self._minuit = minuit
+
+    def __len__(self):
+        return len(self._minuit.pos2var)
+
+    def __getitem__(self, int i):
+        if i < 0 or i >= len(self):
+            raise IndexError
+        return self._state.Parameter(i).Value()
+
+    def __setitem__(self, int i, double value):
+        if i < 0 or i >= len(self):
+            raise IndexError
+        self._state.SetValue(i, value)
+
+    def __repr__(self):
+        s = "<ArgsView of Minuit at %x>" % id(self._minuit)
+        for v in self:
+            s += "\n  {0}".format(v)
+        return s
+
+
+cdef class ValueView(BasicView):
+    """Dict-like view of parameter values."""
+    def _get(self, unsigned int i):
+        return self._state.Parameter(i).Value()
+
+    def _set(self, unsigned int i, double value):
+        self._state.SetValue(i, value)
+
+
+cdef class ErrorView(BasicView):
+    """Dict-like view of parameter errors."""
+    def _get(self, unsigned int i):
+        return self._state.Parameter(i).Error()
+
+    def _set(self, unsigned int i, double value):
+        self._state.SetError(i, value)
+
+
+cdef class FixedView(BasicView):
+    """Dict-like view of whether parameters are fixed."""
+    def _get(self, unsigned int i):
+        return self._state.Parameter(i).IsFixed()
+
+    def _set(self, unsigned int i, bint fix):
+        if fix:
+            self._state.Fix(i)
+        else:
+            self._state.Release(i)
+
 
 cdef class Minuit:
     # Standard stuff
@@ -84,31 +202,29 @@ cdef class Minuit:
     cdef readonly object fcn
     """Cost function (usually a chi^2 or likelihood function)"""
 
-    cdef readonly object grad_fcn
+    cdef readonly object grad
     """Gradient function of the cost function"""
+
+    cdef readonly bint use_array_call
+    """Whether to pass parameters as numpy array to cost function"""
 
     # TODO: remove or expose?
     # cdef readonly object varname #:variable names
 
-    cdef readonly object pos2var
+    cdef readonly tuple pos2var
     """Map variable position to name"""
 
     cdef readonly object var2pos
     """Map variable name to position"""
 
-    # Initial settings
-    cdef object initialvalue  #:hold initial values
-    cdef object initialerror  #:hold initial errors
-    cdef object initiallimit  #:hold initial limits
-    cdef object initialfix  #:hold initial fix state
-
     # C++ object state
-    # TODO find a nicer fix: cdef PythonFCN*pyfcn  #:FCN
-    cdef PythonFCNBase*pyfcn  #:FCN
+    cdef FCNBase*pyfcn  #:FCN
     cdef MnApplication*minimizer  #:migrad
     cdef FunctionMinimum*cfmin  #:last migrad result
+    #:initial parameter state
+    cdef MnUserParameterState initial_upst
     #:last parameter state(from hesse/migrad)
-    cdef MnUserParameterState*last_upst
+    cdef MnUserParameterState last_upst
 
     # PyMinuit compatible fields
 
@@ -154,14 +270,17 @@ cdef class Minuit:
     cdef readonly object parameters
     """Parameter name tuple"""
 
-    cdef readonly object args
+    cdef public ArgsView args
     """Parameter value tuple"""
 
-    cdef readonly object values
+    cdef public ValueView values
     """Parameter values (dict: name -> value)"""
 
-    cdef readonly object errors
+    cdef public ErrorView errors
     """Parameter parabolic errors (dict: name -> error)"""
+
+    cdef public FixedView fixed
+    """Whether parameter is fixed (dict: name -> bool)"""
 
     cdef readonly object covariance
     """Covariance matrix (dict (name1, name2) -> covariance).
@@ -225,25 +344,46 @@ cdef class Minuit:
     cdef public object merrors_struct
     """MINOS error calculation information (dict name -> struct)"""
 
-    cdef public object frontend
-    """Minuit frontend.
-
-    TODO: link to description.
-    """
-
     def __init__(self, fcn,
                  throw_nan=False, pedantic=True,
-                 frontend=None, forced_parameters=None, print_level=1,
-                 errordef=None, grad_fcn=None, **kwds):
+                 forced_parameters=None, print_level=0,
+                 errordef=None, grad=None, use_array_call=False,
+                 **kwds):
         """
         Construct minuit object from given *fcn*
 
         **Arguments:**
 
-            - **fcn**: the function to be optimized. Minuit automagically finds
-              parameters names. More information about how
-              Minuit detects function signature can be found in
-              :ref:`function-sig-label`
+            **fcn**, the function to be optimized, is the only required argument.
+
+            Two kinds of function signatures are understood.
+
+            a) Parameters passed as positional arguments
+
+            The function has several positional arguments, one for each fit
+            parameter. Example::
+
+                def func(a, b, c): ...
+
+            The parameters a, b, c must accept a real number.
+
+            iminuit automagically detects parameters names in this case.
+            More information about how the function signature is detected can
+            be found in :ref:`function-sig-label`
+
+            b) Parameters passed as Numpy array
+
+            The function has a single argument which is a Numpy array.
+            Example::
+
+                def func(x): ...
+
+            Pass the keyword `use_array_call=True` to use this signature. For
+            more information, see "Parameter Keyword Arguments" further down.
+
+            If you work with array parameters a lot, have a look at the static
+            initializer method :meth:`from_array_func`, which adds some
+            convenience and safety to this use case.
 
         **Builtin Keyword Arguments:**
 
@@ -252,16 +392,6 @@ cdef class Minuit:
 
             - **pedantic**: warns about parameters that do not have initial
               value or initial error/stepsize set.
-
-            - **frontend**: Minuit frontend. There are two builtin frontends.
-
-                1. ConsoleFrontend which is design to print out to terminal.
-
-                2. HtmlFrontend which is designed to give a nice output in
-                   IPython notebook session.
-
-              By Default, Minuit switch to HtmlFrontend automatically if it
-              is called in IPython session. It uses ConsoleFrontend otherwise.
 
             - **forced_parameters**: tell Minuit not to do function signature
               detection and use this argument instead. (Default None
@@ -277,19 +407,26 @@ cdef class Minuit:
               not callable iminuit will give a warning and set errordef to 1.
               Default None(which means errordef=1 with a warning).
 
-            - **grad_fcn**: Optional. Provide a function that calculates the
+            - **grad**: Optional. Provide a function that calculates the
               gradient analytically and returns an iterable object with one
               element for each dimension. If None is given minuit will
               calculate the gradient numerically. (Default None)
+
+            - **use_array_call**: Optional. Set this to true if your function
+              signature accepts a single numpy array of the parameters. You
+              need to also pass the `forced_parameters` keyword then to
+              explicitly name the parameters.
 
         **Parameter Keyword Arguments:**
 
             Similar to PyMinuit. iminuit allows user to set initial value,
             initial stepsize/error, limits of parameters and whether
             parameter should be fixed or not by passing keyword arguments to
-            Minuit. This is best explained through an example::
+            Minuit.
 
-                def f(x,y):
+            This is best explained through examples::
+
+                def f(x, y):
                     return (x-2)**2 + (y-3)**2
 
             * Initial value(varname)::
@@ -315,7 +452,7 @@ cdef class Minuit:
             .. note::
 
                 Tips: You can use python dictionary expansion to
-                programatically change the fitting arguments.
+                programmatically change the fitting arguments.
 
                 ::
 
@@ -332,71 +469,187 @@ cdef class Minuit:
                     another_fit = Minuit(f, **my_fitarg)
 
         """
+        if use_array_call and forced_parameters is None:
+            raise KeyError("use_array_call=True requires that forced_parameters is set")
 
-        args = describe(fcn) if forced_parameters is None \
+        args = mutil.describe(fcn) if forced_parameters is None \
             else forced_parameters
-        self._check_extra_args(args, kwds)
-        narg = len(args)
-        self.fcn = fcn
-        self.grad_fcn = grad_fcn
 
-        self.frontend = self._auto_frontend() if frontend is None else frontend
+        self.parameters = args
+        self.narg = len(args)
+        check_extra_args(args, kwds)
 
         # Maintain 2 dictionaries to easily convert between
         # parameter names and position
-        self.pos2var = {i: k for i, k in enumerate(args)}
+        self.pos2var = tuple(args)
         self.var2pos = {k: i for i, k in enumerate(args)}
 
-        self.args, self.values, self.errors = None, None, None
-
-        self.initialvalue = {x: maplookup(kwds, x, 0.) for x in args}
-        self.initialerror = {x: maplookup(kwds, 'error_' + x, 1.) for x in args}
-        self.initiallimit = {x: maplookup(kwds, 'limit_' + x, None) for x in args}
-        self.initialfix = {x: maplookup(kwds, 'fix_' + x, False) for x in args}
-
-        self.pyfcn = NULL
-        self.minimizer = NULL
-        self.cfmin = NULL
-        self.last_upst = NULL
-
         if errordef is None:
-            default_errordef = getattr(fcn, 'default_errordef', None)
-            if not callable(default_errordef):
-                if pedantic:
-                    warn(InitialParamWarning(
-                        'errordef is not given. Default to 1.'))
-                self.errordef = 1.0
-            else:
-                self.errordef = default_errordef()
+            if hasattr(fcn, 'default_errordef'):
+                call = getattr(fcn, 'default_errordef')
+                errordef = call()
         else:
-            self.errordef = errordef
+            if not is_number(errordef) or errordef <= 0:
+                raise ValueError("errordef must be a positive number")
+
+        if pedantic: _minuit_methods.pedantic(self, args, kwds, errordef)
+
+        self.errordef = errordef if errordef else 1
+        self.fcn = fcn
+        self.grad = grad
+        self.use_array_call = use_array_call
+
         self.tol = 0.1
         self.strategy = 1
         self.print_level = print_level
-        set_migrad_print_level(print_level)
         self.throw_nan = throw_nan
 
-        self.parameters = args
-        self.args = tuple(self.initialvalue[k] for k in args)
-        self.values = {k: self.initialvalue[k] for k in args}
-        self.errors = {k: self.initialerror[k] for k in args}
+        if self.grad is None:
+            self.pyfcn = new PythonFCN(
+                self.fcn,
+                self.use_array_call,
+                self.errordef,
+                self.parameters,
+                self.throw_nan,
+            )
+        else:
+            self.pyfcn = new PythonGradientFCN(
+                self.fcn,
+                self.grad,
+                self.use_array_call,
+                self.errordef,
+                self.parameters,
+                self.throw_nan,
+            )
+
+        self.fitarg = {}
+        for x in args:
+            val = kwds.get(x, 0.0)
+            err = kwds.get('error_' + x, 1.0)
+            lim = kwds.get('limit_' + x, None)
+            fix = kwds.get('fix_' + x, False)
+            self.fitarg[unicode(x)] = val
+            self.fitarg['error_' + x] = err
+            self.fitarg['limit_' + x] = lim
+            self.fitarg['fix_' + x] = fix
+
+        self.minimizer = NULL
+        self.cfmin = NULL
+        set_parameter_state(&self.initial_upst, self.parameters, self.fitarg)
+        self.last_upst = self.initial_upst
+
+        self.args = ArgsView(self)
+        self.args._state = &self.last_upst
+        self.values = ValueView(self)
+        self.values._state = &self.last_upst
+        self.errors = ErrorView(self)
+        self.errors._state = &self.last_upst
+        self.fixed = FixedView(self)
+        self.fixed._state = &self.last_upst
         self.covariance = None
         self.fval = 0.
         self.ncalls = 0
         self.edm = 1.
         self.merrors = {}
         self.gcc = None
-        if pedantic: self.pedantic(kwds)
 
-        self.fitarg = {}
-        self.fitarg.update(self.initialvalue)
-        self.fitarg.update({'error_' + k: v for k, v in self.initialerror.items()})
-        self.fitarg.update({'limit_' + k: v for k, v in self.initiallimit.items()})
-        self.fitarg.update({'fix_' + k: v for k, v in self.initialfix.items()})
+        self.merrors_struct = mutil.MErrors()
 
-        self.narg = len(self.parameters)
 
-        self.merrors_struct = {}
+    @classmethod
+    def from_array_func(cls, fcn, start, error=None, limit=None, fix=None,
+                        name=None, **kwds):
+        """
+        Construct minuit object from given *fcn* and start sequence.
+
+        This is an alternative named constructor for the minuit object. It is
+        more convenient to use for functions that accept a numpy array.
+
+        **Arguments:**
+
+            **fcn**: The function to be optimized. Must accept a single
+            parameter that is a numpy array.
+
+                def func(x): ...
+
+            **start**: Sequence of numbers. Starting point for the
+            minimization.
+
+        **Keyword arguments:**
+
+            **error**: Optional sequence of numbers. Initial step sizes.
+            Scalars are automatically broadcasted to the length of the
+            start sequence.
+
+            **limit**: Optional sequence of limits that restrict the range in
+            which a parameter is varied by minuit. Limits can be set in
+            several ways. With inf = float("infinity") we get:
+
+            - No limit: None, (-inf, inf), (None, None)
+
+            - Lower limit: (x, None), (x, inf) [replace x with a number]
+
+            - Upper limit: (None, x), (-inf, x) [replace x with a number]
+
+            A single limit is automatically broadcasted to the length of the
+            start sequence.
+
+            **fix**: Optional sequence of boolean values. Whether to fix a
+            parameter to the starting value.
+
+            **name**: Optional sequence of parameter names. If names are not
+            specified, the parameters are called x0, ..., xN.
+
+            All other keywords are forwarded to :class:`Minuit`, see
+            its documentation.
+
+        **Example:**
+
+            A simple example function is passed to Minuit. It accept a numpy
+            array of the parameters. Initial starting values and error
+            estimates are given::
+
+                import numpy as np
+
+                def f(x):
+                    mu = (2, 3)
+                    return np.sum((x-mu)**2)
+
+                # error is automatically broadcasted to (0.5, 0.5)
+                m = Minuit.from_array_func(f, (2, 3),
+                                           error=0.5)
+
+        """
+        npar = len(start)
+        pnames = name if name is not None else ["x%i"%i for i in range(npar)]
+        kwds["forced_parameters"] = pnames
+        kwds["use_array_call"] = True
+        if error is not None:
+            if np.isscalar(error):
+                error = np.ones(npar) * error
+            else:
+                if len(error) != npar:
+                    raise RuntimeError("length of error sequence does "
+                                       "not match start sequence")
+        if limit is not None:
+            if (len(limit) == 2 and
+                np.isscalar(limit[0]) and
+                np.isscalar(limit[1])):
+                limit = [limit for i in range(npar)]
+            else:
+                if len(limit) != npar:
+                    raise RuntimeError("length of limit sequence does "
+                                       "not match start sequence")
+        for i, name in enumerate(pnames):
+            kwds[name] = start[i]
+            if error is not None:
+                kwds["error_" + name] = error[i]
+            if limit is not None:
+                kwds["limit_" + name] = limit[i]
+            if fix is not None:
+                kwds["fix_" + name] = fix[i]
+        return Minuit(fcn, **kwds)
+
 
     def migrad(self, int ncall=10000, resume=True, int nsplit=1, precision=None):
         """Run migrad.
@@ -410,7 +663,10 @@ cdef class Minuit:
         **Arguments:**
 
             * **ncall**: integer (approximate) maximum number of call before
-              migrad stop trying. Default 10000.
+              migrad will stop trying. Default: 10000. Note: Migrad may
+              slightly violate this limit, because it checks the condition
+              only after a full iteration of the algorithm, which usually
+              performs several function calls.
 
             * **resume**: boolean indicating whether migrad should resume from
               the previous minimizer attempt(True) or should start from the
@@ -432,79 +688,84 @@ cdef class Minuit:
         """
         #construct new fcn and migrad if
         #it's a clean state or resume=False
-        cdef MnUserParameterState*ups = NULL
         cdef MnStrategy*strat = NULL
 
-        if self.print_level > 0:
-            self.frontend.print_banner('MIGRAD')
-
-        if not resume or self.is_clean_state():
-            self.construct_FCN()
-            if self.minimizer is not NULL: del self.minimizer
-            ups = self.initialParameterState()
-            strat = new MnStrategy(self.strategy)
-
-            if self.grad_fcn is None:
-                self.minimizer = new MnMigrad(
-                    deref(<FCNBase*> self.pyfcn),
-                    deref(ups), deref(strat)
-                )
-            else:
-                self.minimizer = new MnMigrad(
-                    deref(dynamic_cast[FCNGradientBasePtr](self.pyfcn)),
-                    deref(ups), deref(strat)
-                )
-
-            del ups;
-            ups = NULL
-            del strat;
-            strat = NULL
-
         if not resume:
-            self.pyfcn.resetNumCall()
+            self.last_upst = self.initial_upst
 
-        del self.cfmin  #remove the old one
+        if self.minimizer is not NULL:
+            del self.minimizer
+            self.minimizer = NULL
+        strat = new MnStrategy(self.strategy)
+
+        if self.grad is None:
+            self.minimizer = new MnMigrad(
+                deref(<FCNBase*> self.pyfcn),
+                self.last_upst, deref(strat)
+            )
+        else:
+            self.minimizer = new MnMigrad(
+                deref(<FCNGradientBase*> self.pyfcn),
+                self.last_upst, deref(strat)
+            )
+
+        del strat
+        strat = NULL
+
+        self.minimizer.Minimizer().Builder().SetPrintLevel(self.print_level)
+        if precision is not None:
+            self.minimizer.SetPrecision(precision)
+
+        cdef PythonGradientFCNPtr grad_ptr = NULL
+        if not resume:
+            dynamic_cast[IMinuitMixinPtr](self.pyfcn).resetNumCall()
+            grad_ptr = dynamic_cast[PythonGradientFCNPtr](self.pyfcn)
+            if grad_ptr:
+                grad_ptr.resetNumGrad()
 
         #this returns a real object need to copy
-        ncall_round = round(1.0 * (ncall) / nsplit)
+        ncall_round = round(1.0 * ncall / nsplit)
         assert (ncall_round > 0)
         totalcalls = 0
         first = True
 
-        if precision is not None:
-            self.minimizer.SetPrecision(precision)
-
-        while (first) or \
-                (not self.cfmin.IsValid() and totalcalls < ncall):
+        while first or (not self.cfmin.IsValid() and totalcalls < ncall):
             first = False
+            if self.cfmin:  # delete existing
+                del self.cfmin
             self.cfmin = call_mnapplication_wrapper(
                 deref(self.minimizer), ncall_round, self.tol)
-            del self.last_upst
-            self.last_upst = new MnUserParameterState(self.cfmin.UserState())
+            self.last_upst = self.cfmin.UserState()
             totalcalls += ncall_round  #self.cfmin.NFcn()
             if self.print_level > 1 and nsplit != 1: self.print_fmin()
 
-        del self.last_upst
-        self.last_upst = new MnUserParameterState(self.cfmin.UserState())
-        self.refreshInternalState()
+        self.last_upst = self.cfmin.UserState()
+        self.refresh_internal_state()
 
         if self.print_level > 0:
             self.print_fmin()
 
-        return self.get_fmin(), self.get_param_states()
+        return mutil.MigradResult(self.get_fmin(), self.get_param_states())
 
-    def hesse(self):
-        """Run HESSE.
 
-        HESSE estimates error matrix by the `second derivative at the minimim
-        <http://en.wikipedia.org/wiki/Hessian_matrix>`_. This error matrix
-        is good if your :math:`\chi^2` or likelihood profile is parabolic at
-        the minimum. From my experience, most of the simple fits are.
+    def hesse(self, unsigned int maxcall=0):
+        """Run HESSE to compute parabolic errors.
 
-        :meth:`minos` makes no parabolic assumption and scan the likelihood
-        and give the correct error asymmetric error in all cases(Unless your
-        likelihood profile is utterly discontinuous near the minimum). But,
-        it is much more computationally expensive.
+        HESSE estimates the covariance matrix by inverting the matrix of
+        `second derivatives (Hesse matrix) at the minimum
+        <http://en.wikipedia.org/wiki/Hessian_matrix>`_. This covariance
+        matrix is valid if your :math:`\chi^2` or likelihood profile looks
+        like a hyperparabola around the the minimum. This is usually the case,
+        especially when you fit many observations (in the limit of infinite
+        samples this is always the case). If you want to know how your
+        parameters are correlated, you also need to use HESSE.
+
+        Also see :meth:`minos`, which computes the uncertainties in a
+        different way.
+
+        **Arguments:**
+            - **maxcall**: limit the number of calls made by MINOS.
+              Default: 0 (uses an internal heuristic by C++ MINUIT).
 
         **Returns:**
 
@@ -512,27 +773,25 @@ cdef class Minuit:
         """
 
         cdef MnHesse*hesse = NULL
-        cdef MnUserParameterState upst
-        if self.print_level > 0: self.frontend.print_banner('HESSE')
         if self.cfmin is NULL:
             raise RuntimeError('Run migrad first')
         hesse = new MnHesse(self.strategy)
-        if self.grad_fcn is None:
-            upst = hesse.call(
+        if self.grad is None:
+            self.last_upst = hesse.call(
                 deref(<FCNBase*> self.pyfcn),
-                self.cfmin.UserState()
+                self.last_upst,
+                maxcall
             )
         else:
-            upst = hesse.call(
-                deref(dynamic_cast[FCNGradientBasePtr](self.pyfcn)),
-                self.cfmin.UserState()
+            self.last_upst = hesse.call(
+                deref(<FCNGradientBase*> self.pyfcn),
+                self.last_upst,
+                maxcall
             )
-        if not upst.HasCovariance():
+        if not self.last_upst.HasCovariance():
             warn("HESSE Failed. Covariance and GlobalCC will not be available",
                  HesseFailedWarning)
-        del self.last_upst
-        self.last_upst = new MnUserParameterState(upst)
-        self.refreshInternalState()
+        self.refresh_internal_state()
         del hesse
 
         if self.print_level > 0:
@@ -541,24 +800,33 @@ cdef class Minuit:
 
         return self.get_param_states()
 
-    def minos(self, var = None, sigma = 1., unsigned int maxcall=1000):
-        """Run minos for parameter *var*.
 
-        If *var* is None it runs minos for all parameters
+    def minos(self, var=None, sigma=1., unsigned int maxcall=0):
+        """Run MINOS to compute exact asymmetric profile uncertainties.
+
+        MINOS makes no parabolic assumption. It scans the likelihood or
+        chi-square function to construct an (potentially) asymmetric
+        confidence interval. When the confidence intervals computed with
+        HESSE and MINOS differ, the MINOS intervals are to be preferred.
+
+        Since MINOS has to scan the (possibly high-dimensional) objective
+        function, it is much slower than HESSE.
 
         **Arguments:**
 
-            - **var**: optional variable name. Default None.(run minos for
-              every variable)
+            - **var**: optional variable name to compute the error for.
+              If var is not given, MINOS is run for every variable.
             - **sigma**: number of :math:`\sigma` error. Default 1.0.
+            - **maxcall**: limit the number of calls made by MINOS.
+              Default: 0 (uses an internal heuristic by C++ MINUIT).
 
         **Returns:**
 
-            Dictionary of varname to :ref:`minos-error-struct`
-            if minos is requested for all parameters.
+            Dictionary of varname to :ref:`minos-error-struct`, containing
+            all up to now computed errors, including the current request.
 
         """
-        if self.pyfcn is NULL or self.cfmin is NULL:
+        if self.cfmin is NULL:
             raise RuntimeError('Minos require function to be at the minimum.'
                                ' Run migrad first.')
         cdef unsigned int index = 0
@@ -566,8 +834,7 @@ cdef class Minuit:
         cdef MinosError mnerror
         cdef char*name = NULL
         cdef double oldup = self.pyfcn.Up()
-        self.pyfcn.set_up(oldup * sigma * sigma)
-        if self.print_level > 0: self.frontend.print_banner('MINOS')
+        self.pyfcn.SetErrorDef(oldup * sigma * sigma)
         if not self.cfmin.IsValid():
             raise RuntimeError(('Function mimimum is not valid. Make sure'
                                 ' migrad converge first'))
@@ -587,7 +854,7 @@ cdef class Minuit:
                         'Specified variable name for minos is set to fixed'))
                     return None
                 continue
-            if self.grad_fcn is None:
+            if self.grad is None:
                 minos = new MnMinos(
                     deref(<FCNBase*> self.pyfcn),
                     deref(self.cfmin), self.strategy
@@ -598,153 +865,173 @@ cdef class Minuit:
                     deref(self.cfmin), self.strategy
                 )
             mnerror = minos.Minos(index, maxcall)
-            self.merrors_struct[vname] = minoserror2struct(mnerror)
-            if self.print_level > 0:
-                self.frontend.print_merror(
-                    vname, self.merrors_struct[vname])
-        self.refreshInternalState()
+            self.merrors_struct[vname] = minoserror2struct(vname, mnerror)
+        self.refresh_internal_state()
         del minos
-        self.pyfcn.set_up(oldup)
+        self.pyfcn.SetErrorDef(oldup)
         return self.merrors_struct
+
 
     def matrix(self, correlation=False, skip_fixed=True):
         """Error or correlation matrix in tuple or tuples format."""
-        if self.last_upst is NULL:
-            raise RuntimeError("Run migrad/hesse first")
-        if not skip_fixed:
-            raise RuntimeError('skip_fixed=False is not supported')
         if not self.last_upst.HasCovariance():
             raise RuntimeError(
                 "Covariance is not valid. May be the last Hesse call failed?")
 
-        cdef MnUserCovariance cov = self.last_upst.Covariance()
-        params = self.list_of_vary_param()
-        if correlation:
-            ret = tuple(
-                tuple(cov.get(iv1, iv2) / sqrt(cov.get(iv1, iv1) * cov.get(iv2, iv2))
-                      for iv1, v1 in enumerate(params)) \
-                for iv2, v2 in enumerate(params)
-            )
+        cdef MnUserCovariance mncov = self.last_upst.Covariance()
+        cdef vector[MinuitParameter] mp = self.last_upst.MinuitParameters()
+
+        # When some parameters are fixed, mncov is a sub-matrix. If skip-fixed
+        # is false, we need to expand the sub-matrix back into the full form.
+        # This requires a translation between sub-index und full-index.
+        if skip_fixed:
+            npar = 0
+            for i in range(mp.size()):
+                if not mp[i].IsFixed():
+                    npar += 1
+            ind = range(npar)
+            def cov(i, j):
+                return mncov.get(i, j)
         else:
-            ret = tuple(
-                tuple(cov.get(iv1, iv2)
-                      for iv1, v1 in enumerate(params)) \
-                for iv2, v2 in enumerate(params)
-            )
+            ext2int = {}
+            iint = 0
+            for i in range(mp.size()):
+                if not mp[i].IsFixed():
+                    ext2int[i] = iint
+                    iint += 1
+            ind = range(mp.size())
+            def cov(i, j):
+                if i not in ext2int or j not in ext2int:
+                    return 0.0
+                return mncov.get(ext2int[i], ext2int[j])
+
+        names = self.list_of_vary_param() if skip_fixed else list(self.values)
+        if correlation:
+            def cor(i, j):
+                return cov(i, j) / (sqrt(cov(i, i) * cov(j, j)) + 1e-100)
+            ret = mutil.Matrix(names, ((cor(i, j) for i in ind) for j in ind))
+        else:
+            ret = mutil.Matrix(names, ((cov(i, j) for i in ind) for j in ind))
         return ret
 
-    def print_matrix(self, **kwds):
-        """Show error_matrix"""
-        matrix = self.matrix(correlation=True)
-        vnames = self.list_of_vary_param()
-        self.frontend.print_matrix(vnames, matrix, **kwds)
+    def print_matrix(self):
+        """Show correlation matrix."""
+        print(self.matrix(correlation=True, skip_fixed=True))
 
     def latex_matrix(self):
-        """Build :class:`LatexFactory` object with the correlation matrix
-        """
-        matrix = self.matrix(correlation=True)
-        vnames = self.list_of_vary_param()
-        return LatexFactory.build_matrix(vnames, matrix)
+        """Build :class:`LatexFactory` object with correlation matrix."""
+        matrix = self.matrix(correlation=True, skip_fixed=True)
+        return LatexFactory.build_matrix(matrix.names, matrix)
 
-    def np_matrix(self, correlation=False, skip_fixed=True):
-        """Error or correlation matrix in numpy array format.
+    def np_matrix(self, **kwds):
+        """Covariance or correlation matrix in numpy array format.
+
+        Keyword arguments are forwarded to :meth:`matrix`.
 
         The name of this function was chosen to be analogous to :meth:`matrix`,
-        it returns the same information in a different format.
+        it returns the same information in a different format. For
+        documentation on the arguments, please see :meth:`matrix`.
 
-        Note that a ``numpy.ndarray`` is returned, not a ``numpy.matrix``
+        **Returns:**
+
+            2D ``numpy.ndarray`` of shape (N,N) (not a ``numpy.matrix``).
         """
-        import numpy as np
-        matrix = self.matrix(correlation=correlation, skip_fixed=skip_fixed)
-        return np.array(matrix, dtype=np.float64)
+        matrix = self.matrix(**kwds)
+        return np.array(matrix, dtype=np.double)
+
+    def np_values(self):
+        """Parameter values in numpy array format.
+
+        Fixed parameters are included, the order follows :attr:`parameters`.
+
+        **Returns:**
+
+            ``numpy.ndarray`` of shape (N,).
+        """
+        return np.array(self.args, dtype=np.double)
+
+    def np_errors(self):
+        """Hesse parameter errors in numpy array format.
+
+        Fixed parameters are included, the order follows :attr:`parameters`.
+
+        **Returns:**
+
+            ``numpy.ndarray`` of shape (N,).
+        """
+        a = np.empty(len(self.parameters), dtype=np.double)
+        for i, k in enumerate(self.parameters):
+            a[i] = self.errors[k]
+        return a
+
+    def np_merrors(self):
+        """Minos parameter errors in numpy array format.
+
+        Fixed parameters are included, the order follows :attr:`parameters`.
+
+        The format of the produced array follows matplotlib conventions, as
+        in ``matplotlib.pyplot.errorbar``. The shape is (2, N) for N
+        parameters. The first row represents the downward error as a positive
+        offset from the center. Likewise, the second row represents the
+        upward error as a positive offset from the center.
+
+        **Returns:**
+
+            ``numpy.ndarray`` of shape (2, N).
+        """
+        # array format follows matplotlib conventions, see pyplot.errorbar
+        a = np.empty((2, len(self.parameters)), dtype=np.double)
+        for i, k in enumerate(self.parameters):
+            a[0, i] = -self.merrors[(k, -1.0)]
+            a[1, i] = self.merrors[(k, 1.0)]
+        return a
+
+    def np_covariance(self):
+        """Covariance matrix in numpy array format.
+
+        Fixed parameters are included, the order follows :attr:`parameters`.
+
+        **Returns:**
+
+            ``numpy.ndarray`` of shape (N,N) (not a ``numpy.matrix``).
+        """
+        return self.np_matrix(correlation=False, skip_fixed=False)
 
     def is_fixed(self, vname):
-        """Check if variable *vname* is (initially) fixed"""
-        if vname not in self.parameters:
-            raise RuntimeError('Cannot find %s in list of variables.')
-        cdef unsigned int index = self.var2pos[vname]
-        if self.last_upst is NULL:
-            return self.initialfix[vname]
-        else:
-            return self.last_upst.MinuitParameters()[index].IsFixed()
+        """Check if variable *vname* is fixed.
 
-    def _prepare_param(self):
-        cdef vector[MinuitParameter] vmps = self.last_upst.MinuitParameters()
-        cdef int i
-        tmp = []
-        for i in range(vmps.size()):
-            tmp.append(minuitparam2struct(vmps[i]))
-        return tmp
-
-    #dealing with frontend conversion
-    def print_param(self, **kwds):
-        """Print current parameter state.
-
-        Extra keyword arguments will be passed to frontend.print_param.
+        Note that `Minuit.fixed` was added to fix and release parameters.
         """
-        if self.last_upst is NULL:
-            self.print_initial_param(**kwds)
-            return
-        p = self._prepare_param()
-        self.frontend.print_param(p, self.merrors_struct, **kwds)
+        return self.fixed[vname]
+
+    def print_param(self, **kwds):
+        """Print current parameter state."""
+        # fetches the initial state if migrad was not run
+        print(self.get_param_states())
 
     def latex_param(self):
         """build :class:`iminuit.latex.LatexTable` for current parameter"""
-        p = self._prepare_param()
-        return LatexFactory.build_param_table(p, self.merrors_struct)
-
-    def _prepare_initial_param(self):
-        tmp = []
-        for i, vname in enumerate(self.parameters):
-            mps = Struct(
-                number=i + 1,
-                name=vname,
-                value=self.initialvalue[vname],
-                error=self.initialerror[vname],
-                is_const=False,
-                is_fixed=self.initialfix[vname],
-                has_limits=self.initiallimit[vname] is not None,
-                lower_limit=self.initiallimit[vname][0]
-                if self.initiallimit[vname] is not None else None,
-                upper_limit=self.initiallimit[vname][1]
-                if self.initiallimit[vname] is not None else None,
-                has_lower_limit=self.initiallimit[vname] is not None
-                                and self.initiallimit[vname][0] is not None,
-                has_upper_limit=self.initiallimit[vname] is not None
-                                and self.initiallimit[vname][1] is not None
-            )
-            tmp.append(mps)
-        return tmp
+        params = self.get_param_states()
+        return LatexFactory.build_param_table(params, self.merrors_struct)
 
     def print_initial_param(self, **kwds):
         """Print initial parameters"""
-        p = self._prepare_initial_param()
-        self.frontend.print_param(p, {}, **kwds)
+        print(self.get_initial_param_states())
 
     def latex_initial_param(self):
         """Build :class:`iminuit.latex.LatexTable` for initial parameter"""
-        p = self._prepare_initial_param()
-        return LatexFactory.build_param_table(p, {})
+        params = self.get_initial_param_states()
+        return LatexFactory.build_param_table(params, {})
 
     def print_fmin(self):
-        """Print current function minimum state"""
-        #cdef MnUserParameterState ust = MnUserParameterState(
-        #                               self.cfmin.UserState())
+        """Print current function minimum data object"""
         if self.cfmin is NULL:
             raise RuntimeError("Function minimum has not been calculated.")
-        sfmin = cfmin2struct(self.cfmin)
-        ncalls = 0 if self.pyfcn is NULL else self.pyfcn.getNumCall()
-
-        self.frontend.print_hline()
-        self.frontend.print_fmin(sfmin, self.tol, ncalls)
-        self.print_param()
-        self.frontend.print_hline()
+        print(self.get_fmin())
 
     def print_all_minos(self):
         """Print all minos errors (and its states)"""
-        for vname in self.list_of_vary_param():
-            if vname in self.merrors_struct:
-                self.frontend.print_merror(vname, self.merrors_struct[vname])
+        print(self.merrors_struct)
 
     def set_up(self, double errordef):
         """Alias for :meth:`set_errordef`"""
@@ -759,8 +1046,7 @@ cdef class Minuit:
         # It was this before, but that is currently broken.
         # http://wwwasdoc.web.cern.ch/wwwasdoc/minuit/node31.html
         self.errordef = errordef
-        if self.pyfcn is not NULL:
-            self.pyfcn.set_up(errordef)
+        self.pyfcn.SetErrorDef(errordef)
 
     def set_strategy(self, value):
         """Set strategy.
@@ -780,115 +1066,80 @@ cdef class Minuit:
         - 3 really paranoid
         """
         self.print_level = lvl
-        set_migrad_print_level(lvl)
+        if self.minimizer:
+            self.minimizer.Minimizer().Builder().SetPrintLevel(self.print_level)
 
     def get_fmin(self):
-        """Current FunctionMinimum Struct"""
-        return cfmin2struct(self.cfmin) if self.cfmin is not NULL else None
+        """Current function minimum data object"""
+        sfmin = None
+        if self.cfmin is not NULL:
+            sfmin = cfmin2struct(self.cfmin, self.tol, self.get_num_call_fcn())
+        return sfmin
 
     # Expose internal state using various structs
 
     def get_param_states(self):
-        """List of current MinuitParameter Struct for all parameters"""
-        if self.last_upst is NULL:
-            return self.get_initial_param_state()
-        cdef vector[MinuitParameter] vmps = self.last_upst.MinuitParameters()
-        cdef int i
-        ret = []
-        for i in range(vmps.size()):
-            ret.append(minuitparam2struct(vmps[i]))
-        return ret
+        """List of current parameter data objects"""
+        up = self.last_upst
+        cdef vector[MinuitParameter] vmps = up.MinuitParameters()
+        return mutil.Params((minuitparam2struct(vmps[i]) for i in range(vmps.size())),
+                            self.merrors_struct)
+
+    def get_initial_param_states(self):
+        """List of current parameter data objects set to the initial fit state"""
+        up = self.initial_upst
+        cdef vector[MinuitParameter] vmps = up.MinuitParameters()
+        return mutil.Params((minuitparam2struct(vmps[i]) for i in range(vmps.size())),
+                            None)
 
     def get_merrors(self):
-        """Dictionary of varname-> MinosError Struct"""
+        """Dictionary of varname -> Minos data object"""
         return self.merrors_struct
-
-    def get_initial_param_state(self):
-        """Initial setting in form of MinuitParameter Struct"""
-        raise NotImplementedError
 
     def get_num_call_fcn(self):
         """Total number of calls to FCN (not just the last operation)"""
-        return 0 if self.pyfcn is NULL else self.pyfcn.getNumCall()
+        cdef IMinuitMixinPtr ptr = dynamic_cast[IMinuitMixinPtr](self.pyfcn)
+        return ptr.getNumCall() if ptr else 0
+
+    def get_num_call_grad(self):
+        """Total number of calls to Gradient (not just the last operation)"""
+        cdef PythonGradientFCNPtr ptr = dynamic_cast[PythonGradientFCNPtr](self.pyfcn)
+        return ptr.getNumGrad() if ptr else 0
 
     def migrad_ok(self):
-        """Check if minimum is valid"""
+        """Check if minimum is valid."""
         return self.cfmin is not NULL and self.cfmin.IsValid()
 
     def matrix_accurate(self):
         """Check if covariance (of the last migrad) is accurate"""
-        return self.last_upst is not NULL and \
-               self.cfmin is not NULL and \
-               self.cfmin.HasAccurateCovar()
+        return self.cfmin is not NULL and \
+            self.cfmin.HasAccurateCovar()
 
     def list_of_fixed_param(self):
         """List of (initially) fixed parameters"""
-        return [v for v in self.parameters if self.initialfix[v]]
+        return [name for (name, is_fixed) in self.fixed.items() if is_fixed]
 
     def list_of_vary_param(self):
         """List of (initially) float varying parameters"""
-        return [v for v in self.parameters if not self.initialfix[v]]
-
+        return [name for (name, is_fixed) in self.fixed.items() if not is_fixed]
 
     # Various utility functions
 
-    cdef construct_FCN(self):
-        """Construct or re-construct FCN"""
-        del self.pyfcn
-        if self.grad_fcn is None:
-            self.pyfcn = new PythonFCN(
-                self.fcn,
-                self.errordef,
-                self.parameters,
-                self.throw_nan)
-        else:
-            self.pyfcn = new PythonGradientFCN(
-                self.fcn,
-                self.grad_fcn,
-                self.errordef,
-                self.parameters,
-                self.throw_nan)
-
     def is_clean_state(self):
         """Check if minuit is in a clean state, ie. no migrad call"""
-        return self.pyfcn is NULL and \
-               self.minimizer is NULL and self.cfmin is NULL
+        return self.minimizer is NULL and self.cfmin is NULL
 
     cdef void clear_cobj(self):
-        #clear C++ internal state
-        del self.pyfcn;
+        # clear C++ internal state
+        del self.pyfcn
         self.pyfcn = NULL
-        del self.minimizer;
+        del self.minimizer
         self.minimizer = NULL
-        del self.cfmin;
+        del self.cfmin
         self.cfmin = NULL
-        del self.last_upst;
-        self.last_upst = NULL
 
     def __dealloc__(self):
         self.clear_cobj()
-
-    def pedantic(self, kwds):
-        for vn in self.parameters:
-            if vn not in kwds:
-                warn(('Parameter %s does not have initial value. '
-                      'Assume 0.') % (vn), InitialParamWarning)
-            if 'error_' + vn not in kwds and 'fix_' + param_name(vn) not in kwds:
-                warn(('Parameter %s is floating but does not '
-                      'have initial step size. Assume 1.') % (vn),
-                     InitialParamWarning)
-        for vlim in extract_limit(kwds):
-            if param_name(vlim) not in self.parameters:
-                warn(('%s is given. But there is no parameter %s. '
-                      'Ignore.' % (vlim, param_name(vlim)), InitialParamWarning))
-        for vfix in extract_fix(kwds):
-            if param_name(vfix) not in self.parameters:
-                warn(('%s is given. But there is no parameter %s. \
-                    Ignore.' % (vfix, param_name(vfix)), InitialParamWarning))
-        for verr in extract_error(kwds):
-            if param_name(verr) not in self.parameters:
-                warn(('%s float. But there is no parameter %s. \
-                    Ignore.') % (verr, param_name(verr)), InitialParamWarning)
 
     def mnprofile(self, vname, bins=30, bound=2, subtract_min=False):
         """Calculate minos profile around the specified range.
@@ -917,20 +1168,18 @@ cdef class Minuit:
         if vname not in self.parameters:
             raise ValueError('Unknown parameter %s' % vname)
 
-        if isinstance(bound, (int, long, float)):
+        if is_number(bound):
             if not self.matrix_accurate():
                 warn('Specify nsigma bound but error '
                      'but error matrix is not accurate.')
             start = self.values[vname]
             sigma = self.errors[vname]
             bound = (start - bound * sigma, start + bound * sigma)
-        blength = bound[1] - bound[0]
-        binstep = blength / (bins - 1)
 
-        values = array.array(ARRAY_DOUBLE_TYPECODE,
-                             (bound[0] + binstep * i for i in xrange(bins)))
-        results = array.array(ARRAY_DOUBLE_TYPECODE)
-        migrad_status = []
+        values = np.linspace(bound[0], bound[1], bins, dtype=np.double)
+        results = np.empty(bins, dtype=np.double)
+        migrad_status = np.empty(bins, dtype=np.bool)
+        cdef double vmin = float("infinity")
         for i, v in enumerate(values):
             fitparam = self.fitarg.copy()
             fitparam[vname] = v
@@ -939,15 +1188,15 @@ cdef class Minuit:
                        pedantic=False, forced_parameters=self.parameters,
                        **fitparam)
             m.migrad()
-            migrad_status.append(m.migrad_ok())
+            migrad_status[i] = m.migrad_ok()
             if not m.migrad_ok():
-                warn(('Migrad fails to converge for %s=%f') % (vname, v))
-            results.append(m.fval)
+                warn('Migrad fails to converge for %s=%f' % (vname, v))
+            results[i] = m.fval
+            if m.fval < vmin:
+                vmin = m.fval
 
         if subtract_min:
-            themin = min(results)
-            results = array.array(ARRAY_DOUBLE_TYPECODE,
-                                  (x - themin for x in results))
+            results -= vmin
 
         return values, results, migrad_status
 
@@ -988,8 +1237,8 @@ cdef class Minuit:
             :include-source:
         """
         x, y, s = self.mnprofile(vname, bins, bound, subtract_min)
-        return _plotting.draw_profile(self, vname, x, y, s,
-                                      band=band, text=text)
+        return _minuit_methods.draw_profile(self, vname, x, y, s,
+                                            band=band, text=text)
 
     def profile(self, vname, bins=100, bound=2, args=None, subtract_min=False):
         """Calculate cost function profile around specify range.
@@ -1017,28 +1266,29 @@ cdef class Minuit:
 
             :meth:`mnprofile`
         """
-        if isinstance(bound, (int, long, float)):
-            start = self.values[vname]
-            sigma = self.errors[vname]
-            bound = (start - bound * sigma,
-                     start + bound * sigma)
-        blength = bound[1] - bound[0]
-        binstep = blength / (bins - 1.)
-        args = list(self.args) if args is None else args
-        # center value
-        bins = array.array(ARRAY_DOUBLE_TYPECODE,
-                           (bound[0] + binstep * i for i in xrange(bins)))
-        ret = array.array(ARRAY_DOUBLE_TYPECODE)
-        pos = self.var2pos[vname]
         if subtract_min and self.cfmin is NULL:
             raise RuntimeError("Request for minimization "
                                "subtraction but no minimization has been done. "
                                "Run migrad first.")
-        minval = self.cfmin.Fval() if subtract_min else 0.
-        for val in bins:
-            args[pos] = val
-            ret.append(self.fcn(*args) - minval)
-        return bins, ret
+
+        if is_number(bound):
+            start = self.values[vname]
+            sigma = self.errors[vname]
+            bound = (start - bound * sigma,
+                     start + bound * sigma)
+
+        # center value
+        val = np.linspace(bound[0], bound[1], bins, dtype=np.double)
+        result = np.empty(bins, dtype=np.double)
+        cdef int pos = self.var2pos[vname]
+        cdef list arg = list(self.args if args is None else args)
+        cdef int n = val.shape[0]
+        for i in range(n):
+            arg[pos] = val[i]
+            result[i] = self.fcn(*arg)
+        if subtract_min:
+            result -= self.cfmin.Fval()
+        return val, result
 
     def draw_profile(self, vname, bins=100, bound=2, args=None,
                      subtract_min=False, band=True, text=True):
@@ -1069,8 +1319,8 @@ cdef class Minuit:
             :meth:`profile`
         """
         x, y = self.profile(vname, bins, bound, args, subtract_min)
-        x, y, s = _plotting.draw_profile(self, vname, x, y,
-                                         band=band, text=text)
+        x, y, s = _minuit_methods.draw_profile(self, vname, x, y,
+                                               band=band, text=text)
         return x, y
 
     def contour(self, x, y, bins=20, bound=2, args=None, subtract_min=False):
@@ -1114,8 +1364,13 @@ cdef class Minuit:
             correlation with other parameters that's fixed.
 
         """
-        #don't want to use numpy as requirement for this
-        if isinstance(bound, (int, long, float)):
+
+        if subtract_min and self.cfmin is NULL:
+            raise RuntimeError("Request for minimization "
+                               "subtraction but no minimization has been done. "
+                               "Run migrad first.")
+
+        if is_number(bound):
             x_start = self.values[x]
             x_sigma = self.errors[x]
             x_bound = (x_start - bound * x_sigma, x_start + bound * x_sigma)
@@ -1126,41 +1381,25 @@ cdef class Minuit:
             x_bound = bound[0]
             y_bound = bound[1]
 
-        x_bins = bins
-        y_bins = bins
+        x_val = np.linspace(x_bound[0], x_bound[1], bins)
+        y_val = np.linspace(y_bound[0], y_bound[1], bins)
 
-        x_blength = x_bound[1] - x_bound[0]
-        x_binstep = x_blength / (x_bins - 1.)
+        cdef int x_pos = self.var2pos[x]
+        cdef int y_pos = self.var2pos[y]
 
-        y_blength = y_bound[1] - y_bound[0]
-        y_binstep = y_blength / (y_bins - 1.)
+        cdef list arg = list(self.args if args is None else args)
 
-        x_val = array.array(ARRAY_DOUBLE_TYPECODE,
-                            (x_bound[0] + x_binstep * i for i in xrange(x_bins)))
-        y_val = array.array(ARRAY_DOUBLE_TYPECODE,
-                            (y_bound[0] + y_binstep * i for i in xrange(y_bins)))
+        result = np.empty((bins, bins), dtype=np.double)
+        for i, x in enumerate(x_val):
+            arg[x_pos] = x
+            for j, y in enumerate(y_val):
+                arg[y_pos] = y
+                result[i, j] = self.fcn(*arg)
 
-        x_pos = self.var2pos[x]
-        y_pos = self.var2pos[y]
+        if subtract_min:
+            result -= self.cfmin.Fval()
 
-        args = list(self.args) if args is None else args
-
-        if subtract_min and self.cfmin is NULL:
-            raise RuntimeError("Request for minimization "
-                               "subtraction but no minimization has been done. "
-                               "Run migrad first.")
-        minval = self.cfmin.Fval() if subtract_min else 0.
-
-        ret = list()
-        for yy in y_val:
-            args[y_pos] = yy
-            tmp = array.array(ARRAY_DOUBLE_TYPECODE)
-            for xx in x_val:
-                args[x_pos] = xx
-                tmp.append(self.fcn(*args) - minval)
-            ret.append(tmp)
-
-        return x_val, y_val, ret
+        return x_val, y_val, result
 
     def mncontour(self, x, y, int numpoints=20, sigma=1.0):
         """Minos contour scan.
@@ -1192,7 +1431,7 @@ cdef class Minuit:
             [[x1,y1]...[xn,yn]]
 
         """
-        if self.pyfcn is NULL or self.cfmin is NULL:
+        if self.cfmin is NULL:
             raise ValueError('Run Migrad first')
 
         cdef unsigned int ix = self.var2pos[x]
@@ -1204,12 +1443,12 @@ cdef class Minuit:
             raise ValueError('mncontour has to be run on vary parameters.')
 
         cdef double oldup = self.pyfcn.Up()
-        self.pyfcn.set_up(oldup * sigma * sigma)
+        self.pyfcn.SetErrorDef(oldup * sigma * sigma)
 
         cdef auto_ptr[MnContours] mnc = auto_ptr[MnContours](NULL)
-        if self.grad_fcn is None:
+        if self.grad is None:
             mnc = auto_ptr[MnContours](
-                new MnContours(deref(<FCNBase*> self.pyfcn),
+                new MnContours(deref(<FCNBase *> self.pyfcn),
                                deref(self.cfmin),
                                self.strategy))
         else:
@@ -1219,76 +1458,30 @@ cdef class Minuit:
                                self.strategy))
         cdef ContoursError cerr = mnc.get().Contour(ix, iy, numpoints)
 
-        xminos = minoserror2struct(cerr.XMinosError())
-        yminos = minoserror2struct(cerr.YMinosError())
+        xminos = minoserror2struct(x, cerr.XMinosError())
+        yminos = minoserror2struct(y, cerr.YMinosError())
 
-        self.pyfcn.set_up(oldup)
+        self.pyfcn.SetErrorDef(oldup)
 
         return xminos, yminos, cerr.Points()  #using type coersion here
 
-    def mncontour_grid(self, x, y, bins=100, nsigma=2, numpoints=20,
-                       int sigma_res=4, edges=False):
-        """Compute gridded minos contour.
-
-        **Arguments:**
-
-            - **x**, **y** parameter name
-
-            - **bins** number of bins in the grid. The boundary of the grid is
-              selected automatically by the minos error computed. Default 100.
-
-            - **nsigma** number of sigma to draw. Default 2
-
-            - **numpoints** number of points to calculate mncontour for each
-              sigma points(there are sigma_res*nsigma total)
-
-            - **sigma_res** number of sigma level to calculate MnContours
-
-            - **edges** Return bin edges instead of mid value(pass True if you
-              want to draw it using pcolormesh)
-
-        **Returns:**
-
-            xgrid, ygrid, sigma, rawdata
-
-            rawdata is tuple of (x,y,sigma_level)
-
-        .. seealso::
-
-            :meth:`draw_mncontour`
-
-        .. plot:: pyplots/draw_mncontour.py
-            :include-source:
-
-        """
-        return _plotting.mncontour_grid(self, x, y, numpoints,
-                                        nsigma, sigma_res, bins, edges)
-
-    def draw_mncontour(self, x, y, bins=100, nsigma=2,
-                       numpoints=20, sigma_res=4):
+    def draw_mncontour(self, x, y, nsigma=2, numpoints=20):
         """Draw minos contour.
 
         **Arguments:**
 
             - **x**, **y** parameter name
 
-            - **bins** number of bin in contour grid.
-
-            - **nsigma** number of sigma contour to draw
+            - **nsigma** number of sigma contours to draw
 
             - **numpoints** number of points to calculate for each contour
 
-            - **sigma_res** number of sigma level to calculate MnContours.
-              Default 4.
-
         **Returns:**
 
-            x, y, gridvalue, contour
+            contour
 
-            gridvalue is interorlated nsigma
         """
-        return _plotting.draw_mncontour(self, x, y, bins, nsigma,
-                                        numpoints, sigma_res)
+        return _minuit_methods.draw_mncontour(self, x, y, nsigma, numpoints)
 
     def draw_contour(self, x, y, bins=20, bound=2, args=None,
                      show_sigma=False):
@@ -1308,10 +1501,10 @@ cdef class Minuit:
             :meth:`contour`
             :meth:`mncontour`
         """
-        return _plotting.draw_contour(self, x, y, bins,
-                                      bound, args, show_sigma)
+        return _minuit_methods.draw_contour(self, x, y, bins,
+                                            bound, args, show_sigma)
 
-    cdef refreshInternalState(self):
+    cdef refresh_internal_state(self):
         """Refresh internal state attributes.
 
         These attributes should be in a function instead
@@ -1320,93 +1513,27 @@ cdef class Minuit:
         cdef vector[MinuitParameter] mpv
         cdef MnUserCovariance cov
         cdef double tmp = 0
-        if self.last_upst is not NULL:
-            mpv = self.last_upst.MinuitParameters()
-            self.values = {}
-            self.errors = {}
-            self.args = []
-            for i in range(mpv.size()):
-                self.args.append(mpv[i].Value())
-                self.values[mpv[i].Name()] = mpv[i].Value()
-                self.errors[mpv[i].Name()] = mpv[i].Error()
-            self.args = tuple(self.args)
-            self.fitarg.update(self.values)
-            self.fitarg.update({'error_' + k: v for k, v in self.errors.items()})
-            vary_param = self.list_of_vary_param()
-            if self.last_upst.HasCovariance():
-                cov = self.last_upst.Covariance()
-                self.covariance = \
-                    {(v1, v2): cov.get(i, j) \
-                     for i, v1 in enumerate(vary_param) \
-                     for j, v2 in enumerate(vary_param)}
-            else:
-                self.covariance = None
-            self.fval = self.last_upst.Fval()
-            self.ncalls = self.last_upst.NFcn()
-            self.edm = self.last_upst.Edm()
-            self.gcc = None
-            if self.last_upst.HasGlobalCC() and self.last_upst.GlobalCC().IsValid():
-                self.gcc = {v: self.last_upst.GlobalCC().GlobalCC()[i] for \
-                            i, v in enumerate(self.list_of_vary_param())}
+        mpv = self.last_upst.MinuitParameters()
+        self.fitarg.update({unicode(k): v for k, v in self.values.items()})
+        self.fitarg.update({'error_' + k: v for k, v in self.errors.items()})
+        vary_param = self.list_of_vary_param()
+        if self.last_upst.HasCovariance():
+            cov = self.last_upst.Covariance()
+            self.covariance = \
+                {(v1, v2): cov.get(i, j) \
+                 for i, v1 in enumerate(vary_param) \
+                 for j, v2 in enumerate(vary_param)}
+        else:
+            self.covariance = None
+        self.fval = self.last_upst.Fval()
+        self.ncalls = self.last_upst.NFcn()
+        self.edm = self.last_upst.Edm()
+        self.gcc = None
+        if self.last_upst.HasGlobalCC() and self.last_upst.GlobalCC().IsValid():
+            self.gcc = {v: self.last_upst.GlobalCC().GlobalCC()[i] for \
+                        i, v in enumerate(self.list_of_vary_param())}
 
         self.merrors = {(k, 1.0): v.upper
                         for k, v in self.merrors_struct.items()}
         self.merrors.update({(k, -1.0): v.lower
                              for k, v in self.merrors_struct.items()})
-
-    cdef MnUserParameterState*initialParameterState(self) except *:
-        """Construct parameter state from initial array.
-
-        Caller is responsible for cleaning up the pointer.
-        """
-        cdef MnUserParameterState*ret = new MnUserParameterState()
-        cdef object lb
-        cdef object ub
-        for v in self.parameters:
-            ret.Add(v, self.initialvalue[v], self.initialerror[v])
-
-        for v in self.parameters:
-            if self.initiallimit[v] is not None:
-                lb, ub = self.initiallimit[v]
-                if lb is not None and ub is not None and lb >= ub:
-                    raise ValueError(
-                        'limit for parameter %s is invalid. %r' % (v, (lb, ub)))
-                if lb is not None and ub is None: ret.SetLowerLimit(v, lb)
-                if ub is not None and lb is None: ret.SetUpperLimit(v, ub)
-                if lb is not None and ub is not None: ret.SetLimits(v, lb, ub)
-                #need to set value again
-                #taking care of internal/external transformation
-                ret.SetValue(v, self.initialvalue[v])
-                ret.SetError(v, self.initialerror[v])
-
-        for v in self.parameters:
-            if self.initialfix[v]:
-                ret.Fix(v)
-        return ret
-
-    def _auto_frontend(self):
-        """Determine frontend automatically.
-
-        Use HTML frontend in IPython sessions and console frontend otherwise.
-        """
-        try:
-            __IPYTHON__
-            from iminuit.frontends.html import HtmlFrontend
-            return HtmlFrontend()
-        except NameError:
-            from iminuit.frontends.console import ConsoleFrontend
-            return ConsoleFrontend()
-
-    def _check_extra_args(self, parameters, kwd):
-        """Check keyword arguments to find unwanted/typo keyword arguments"""
-        fixed_param = set('fix_' + p for p in parameters)
-        limit_param = set('limit_' + p for p in parameters)
-        error_param = set('error_' + p for p in parameters)
-        for k in kwd.keys():
-            if k not in parameters and \
-                            k not in fixed_param and \
-                            k not in limit_param and \
-                            k not in error_param:
-                raise RuntimeError(
-                    ('Cannot understand keyword %s. May be a typo?\n'
-                     'The parameters are %r') % (k, parameters))

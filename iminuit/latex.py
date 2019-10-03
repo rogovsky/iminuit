@@ -58,9 +58,6 @@ class LatexTable:
     def _auto_align(self):
         return '|' + 'c|' * self.num_col
 
-    def _xcolor_from_tuple(self, c):
-        return '[RGB]{%d,%d,%d}' % (c[0], c[1], c[2])
-
     def _format(self, s):
         if s in self.latex_map:
             return self.latex_map[s]
@@ -134,8 +131,8 @@ class LatexTable:
         # decorate it
 
         for (i, j), c in self.cell_color.items():
-            tdata[i][j] = '\\cellcolor' + self._xcolor_from_tuple(c) + \
-                          ' ' + tdata[i][j]
+            xcolor = '[RGB]{%d,%d,%d}' % (c[0], c[1], c[2])
+            tdata[i][j] = '\\cellcolor' + xcolor + ' ' + tdata[i][j]
 
         for line in tdata:
             ret += ' & '.join(line) + '\\\\\n'
@@ -164,7 +161,7 @@ class LatexFactory:
 
         table = LatexTable(headers=headers, data=data, rotate_header=True,
                            latex_map=latex_map)
-        table.float_format = '%3.2f'
+        table.float_format = '%.2g'
         for (i, j), c in color.items():
             table.set_cell_color(i, j, c)
         return table
@@ -173,22 +170,21 @@ class LatexFactory:
     def build_param_table(cls, mps, merr=None, float_format='%5.3e',
                           smart_latex=True, latex_map=None):
         """build latex parameter table"""
-        headers = ['', 'Name', 'Value', 'Para Error', 'Error+',
-                   'Error-', 'Limit+', 'Limit-', 'FIXED', ]
+        headers = ['', 'Name', 'Value', 'Hesse Error', 'Minos Error-',
+                   'Minos Error+', 'Limit-', 'Limit+', 'Fixed?', ]
 
         data = []
         for i, mp in enumerate(mps):
             minos_p, minos_m = ('', '') if merr is None or mp.name not in merr else \
-                (merr[mp.name].upper, merr[mp.name].lower)
-            limit_p, limit_m = ('', '') if not mp.has_limits else \
-                (mp.upper_limit, mp.lower_limit)
-            fixed = 'FIXED' if mp.is_fixed else ''
-            j = i + 1
+                ('%g' % merr[mp.name].upper, '%g' % merr[mp.name].lower)
+            limit_p = '' if mp.upper_limit is None else '%g' % mp.upper_limit
+            limit_m = '' if mp.lower_limit is None else '%s' % mp.lower_limit
+            fixed = 'Yes' if mp.is_fixed else 'No'
             tmp = [
-                j,
+                i,
                 mp.name,
-                mp.value,
-                mp.error,
+                '%g' % mp.value,
+                '%g' % mp.error,
                 minos_m,
                 minos_p,
                 limit_m,

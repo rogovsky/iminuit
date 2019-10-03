@@ -1,47 +1,172 @@
-"""IMinuit utility functions and classes.
+"""iminuit utility functions and classes.
 """
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 import re
-from .py23_compat import is_string
-
-__all__ = [
-    'describe',
-    'Struct',
-    'fitarg_rename',
-    'true_param',
-    'param_name',
-    'extract_iv',
-    'extract_limit',
-    'extract_error',
-    'extract_fix',
-    'remove_var',
-    'arguments_from_docstring',
-]
+import types
+from collections import OrderedDict, namedtuple
+from . import repr_html
+from . import repr_text
+from operator import itemgetter
 
 
-class Struct:
-    """A Struct is a Python dict with tab completion.
+class Matrix(tuple):
+    """Matrix data object (tuple of tuples)."""
+    __slots__ = ()
 
-    Example:
+    def __new__(self, names, data):
+        self.names = names
+        return tuple.__new__(Matrix, (tuple(x) for x in data))
 
-    >>> s = Struct(a=42)
-    >>> s['a']
-    42
-    >>> s.a
-    42
-    """
-    def __init__(self, **kwds):
-        self.__dict__.update(kwds)
+    def _repr_html_(self):
+        return repr_html.matrix(self)
 
     def __str__(self):
-        return self.__dict__.__str__()
+        return repr_text.matrix(self)
 
-    def __repr__(self):
-        return self.__str__()
+    def _repr_pretty_(self, p, cycle):
+        if cycle:
+            p.text("Matrix(...)")
+        else:
+            p.text(str(self))
 
-    def __getitem__(self, s):
-        return self.__dict__[s]
+
+class dict_interface_mixin(object):
+    "Provides a dict-like interface for a namedtuple."
+
+    __slots__ = ()
+
+    def __getitem__(self, key):
+        base = super(dict_interface_mixin, self)
+        if isinstance(key, int):
+            return base.__getitem__(key)
+        else:
+            return base.__getattribute__(key)
+
+    def __contains__(self, key):
+        return key in self.keys()
+
+    def __iter__(self):
+        return iter(self.keys())
+
+    def keys(self):
+        return self._fields
+
+    def values(self):
+        base = super(dict_interface_mixin, self)
+        return tuple(base.__getitem__(i) for i in range(len(self)))
+
+    def items(self):
+        keys = self.keys()
+        values = self.values()
+        return tuple((keys[i], values[i]) for i in range(len(self)))
+
+    def __str__(self):
+        return self.__class__.__name__ + "(" + ", ".join("{}={}".format(k, repr(v)) for (k, v) in self.items()) + ")"
+
+
+class Param(dict_interface_mixin, namedtuple("Param",
+    "number name value error is_const is_fixed has_limits "
+    "has_lower_limit has_upper_limit lower_limit upper_limit")):
+    """Data object for a single Parameter."""
+
+    __slots__ = ()
+
+
+class Params(list):
+    """List of parameter data objects."""
+
+    def __init__(self, seq, merrors):
+        list.__init__(self, seq)
+        self.merrors = merrors
+
+    def _repr_html_(self):
+        return repr_html.params(self)
+
+    def __str__(self):
+        return repr_text.params(self)
+
+    def _repr_pretty_(self, p, cycle):
+        if cycle:
+            p.text("[...]")
+        else:
+            p.text(str(self))
+
+
+class MError(dict_interface_mixin, namedtuple("MError",
+    "name is_valid lower upper lower_valid upper_valid at_lower_limit at_upper_limit "
+    "at_lower_max_fcn at_upper_max_fcn lower_new_min upper_new_min nfcn min")):
+    """Minos result object."""
+
+    __slots__ = ()
+
+    def _repr_html_(self):
+        return repr_html.merror(self)
+
+    def __str__(self):
+        return repr_text.merror(self)
+
+    def _repr_pretty_(self, p, cycle):
+        if cycle:
+            p.text("MError(...)")
+        else:
+            p.text(str(self))
+
+
+class MErrors(OrderedDict):
+    """Dict from parameter name to Minos result object."""
+
+    def _repr_html_(self):
+        return "\n".join([x._repr_html_() for x in self.values()])
+
+    def __str__(self):
+        return "\n".join([str(x) for x in self.values()])
+
+    def _repr_pretty_(self, p, cycle):
+        if cycle:
+            p.text("MErrors(...)")
+        else:
+            p.text(str(self))
+
+
+class FMin(dict_interface_mixin, namedtuple("FMin",
+    "fval edm tolerance nfcn ncalls up is_valid has_valid_parameters has_accurate_covar "
+    "has_posdef_covar has_made_posdef_covar hesse_failed has_covariance is_above_max_edm "
+    "has_reached_call_limit")):
+    """Function minimum status object."""
+
+    __slots__ = ()
+
+    def _repr_html_(self):
+        return repr_html.fmin(self)
+
+    def __str__(self):
+        return repr_text.fmin(self)
+
+    def _repr_pretty_(self, p, cycle):
+        if cycle:
+            p.text("FMin(...)")
+        else:
+            p.text(str(self))
+
+
+# MigradResult used to be a tuple, so we don't add the dict interface
+class MigradResult(namedtuple("MigradResult", "fmin params")):
+    """Holds the Migrad result."""
+
+    __slots__ = ()
+
+    def __str__(self):
+        return str(self.fmin) + "\n" + str(self.params)
+
+    def _repr_html_(self):
+        return self.fmin._repr_html_() + self.params._repr_html_()
+
+    def _repr_pretty_(self, p, cycle):
+        if cycle:
+            p.text("MigradResult(...)")
+        else:
+            p.text(str(self))
 
 
 def arguments_from_docstring(doc):
@@ -100,13 +225,12 @@ def arguments_from_funccode(f):
     """
     fc = fc_or_c(f)
     vnames = fc.co_varnames
+    nargs = fc.co_argcount
     # bound method and fake function will be None
-    if is_bound(f):
-        # bound method dock off self
-        return list(vnames[1:fc.co_argcount])
-    else:
-        # unbound and fakefunc
-        return list(vnames[:fc.co_argcount])
+    args = vnames[1 if is_bound(f) else 0:nargs]
+    if not args:
+        raise RuntimeError('Function has variable number of arguments')
+    return list(args)
 
 
 def arguments_from_call_funccode(f):
@@ -114,7 +238,10 @@ def arguments_from_call_funccode(f):
     """
     fc = fc_or_c(f.__call__)
     argcount = fc.co_argcount
-    return list(fc.co_varnames[1:argcount])
+    args = list(fc.co_varnames[1:argcount])
+    if not args:
+        raise RuntimeError('Function has variable number of arguments')
+    return args
 
 
 def is_bound(f):
@@ -220,7 +347,7 @@ def fitarg_rename(fitarg, ren):
 
     """
     tmp = ren
-    if is_string(ren):
+    if isinstance(ren, str):
         ren = lambda x: tmp + '_' + x
     ret = {}
     prefix = ['limit_', 'fix_', 'error_', ]
@@ -285,11 +412,24 @@ def remove_var(b, exclude):
     return dict((k, v) for k, v in b.items() if param_name(k) not in exclude)
 
 
-def make_func_code(params=None):
+def make_func_code(params):
     """Make a func_code object to fake function signature.
 
     You can make a funccode from describable object by::
 
         make_func_code(describe(f))
     """
-    return Struct(co_varnames=params, co_argcount=len(params))
+    class FuncCode(object):
+        __slots__ = ('co_varnames', 'co_argcount')
+    fc = FuncCode()
+    fc.co_varnames = params
+    fc.co_argcount = len(params)
+    return fc
+
+
+def format_exception(etype, evalue, tb):
+    # work around for https://bugs.python.org/issue17413
+    # the issue is not fixed in Python-3.7
+    import traceback
+    s = "".join(traceback.format_tb(tb))
+    return "%s: %s\n%s" % (etype.__name__, evalue, s)
