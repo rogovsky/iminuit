@@ -17,18 +17,12 @@ Further information:
 * Docs: https://iminuit.readthedocs.io
 """
 
-__all__ = [
-    'Minuit',
-    'minimize',
-    'describe',
-    '__version__',
-    'test',
-]
+__all__ = ["Minuit", "minimize", "describe", "__version__", "test"]
 
 from ._libiminuit import Minuit
 from ._minimize import minimize
 from .util import describe
-from .info import __version__
+from .version import __version__
 
 
 def test(args=None):
@@ -42,5 +36,6 @@ def test(args=None):
     """
     # http://pytest.org/latest/usage.html#calling-pytest-from-python-code
     import pytest
-    args = ['-v', '--pyargs', 'iminuit']
+
+    args = ["-v", "--pyargs", "iminuit"]
     pytest.main(args)
